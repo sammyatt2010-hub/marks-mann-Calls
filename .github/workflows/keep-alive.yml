@@ -1,0 +1,52 @@
+name: Keep Streamlit app awake
+
+# Visits the Marks & Mann Call Hub on Streamlit Cloud every 4 hours so it
+# never reaches the sleep timeout. If it has already gone to sleep, it clicks
+# the "Yes, get this app back up!" button to wake it.
+
+on:
+  schedule:
+    - cron: "23 */4 * * *"   # every 4 hours (UTC)
+  workflow_dispatch:          # lets you run it by hand from the Actions tab
+
+permissions:
+  contents: read
+
+jobs:
+  keep-alive:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Playwright
+        run: |
+          pip install playwright==1.48.0
+          python -m playwright install --with-deps chromium
+
+      - name: Visit the app (and wake it if asleep)
+        env:
+          APP_URL: https://marks-mann-calls-vpf5ej4nmp9yymqy8wwqtf.streamlit.app/
+        run: |
+          python - <<'EOF'
+          import os
+          from playwright.sync_api import sync_playwright
+
+          url = os.environ["APP_URL"]
+          with sync_playwright() as p:
+              browser = p.chromium.launch()
+              page = browser.new_page()
+              page.goto(url, wait_until="domcontentloaded", timeout=90000)
+              page.wait_for_timeout(8000)
+              wake = page.get_by_role("button", name="Yes, get this app back up!")
+              if wake.count() > 0:
+                  print("App was asleep - waking it up")
+                  wake.first.click()
+                  page.wait_for_timeout(90000)
+              else:
+                  print("App is awake - visit registered")
+                  page.wait_for_timeout(20000)
+              browser.close()
+          EOF
