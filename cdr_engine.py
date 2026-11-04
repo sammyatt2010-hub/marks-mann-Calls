@@ -662,19 +662,44 @@ def load_marksmann(raw: bytes | list[bytes]) -> pd.DataFrame:
 
     rows: list[dict] = []
     internal = 0
+    internal_rows: list[dict] = []
 
     def add(**kw):
         rows.append({"cost": "", "mos": "", "clid": "", "dst_label": "", "pbx_status": "", **kw})
 
+    # exports with "include transfers" switched on link the colleague call to the customer's call via ParentCallID
+    parent_col = t["ParentCallID"] if "ParentCallID" in t else pd.Series("", index=t.index)
+    inbound_ids = set(t.loc[t["ctype"] == "inbound", "CallID"])
+    callers = dict(zip(t["CallID"], t["From"].map(norm_number)))
+    parent_of = {c: p for c, p in zip(t["CallID"], parent_col) if p}
+
+    def root_call(cid: str) -> str:
+        """Follow a hand-over chain (customer -> A -> B -> C) back to the customer's inbound call."""
+        seen = set()
+        while cid in parent_of and cid not in seen and cid not in inbound_ids:
+            seen.add(cid)
+            cid = parent_of[cid]
+        return cid if cid in inbound_ids else ""
+
+    transfers: list[dict] = []
     for i, r in t.iterrows():
         sec = int(r["ts"].timestamp())
         if r["ctype"] == "internal":
             internal += 1
+            parent = root_call(r["CallID"]) if parent_col.get(i, "") else ""
+            is_tr = bool(parent)
+            row = {"ts": r["ts"], "from": _mm_name(r["From"]), "to": _mm_name(r["Answered By"] or r["To"]),
+                   "secs": int(r["secs"]), "ok": bool(r["ok"]), "transfer": is_tr, "parent": parent if is_tr else ""}
+            internal_rows.append(row)
+            if is_tr:
+                transfers.append({**row, "caller": callers.get(parent, "")})
             continue
         if r["ctype"] == "outbound":
             dst = norm_number(r["To"])
             if endpoint_kind(dst) != "NUM":
                 internal += 1  # shortcodes / extensions
+                internal_rows.append({"ts": r["ts"], "from": _mm_name(r["From"]), "to": "Shortcode",
+                                      "secs": int(r["secs"]), "ok": bool(r["ok"]), "transfer": False, "parent": ""})
                 continue
             who = _mm_name(r["From"])
             talk = int(r["secs"]) if r["ok"] else 0
@@ -725,7 +750,9 @@ def load_marksmann(raw: bytes | list[bytes]) -> pd.DataFrame:
     df["mos_v"] = np.nan
     df["cost_v"] = 0.0
     df["provider"] = "marksmann"
-    df.attrs["dropped"] = {"internal": internal}
+    df.attrs["dropped"] = {"internal": internal - len(transfers), "transfers": len(transfers)}
+    df.attrs["mm_transfers"] = transfers  # customer calls handed from one colleague to another
+    df.attrs["mm_internal"] = internal_rows  # colleague-to-colleague calls, for the user assessment
     return df.sort_values(["ts", "uid"]).reset_index(drop=True)
 
 
