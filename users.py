@@ -57,7 +57,9 @@ def build_user_report(df: pd.DataFrame, a: Analysis, start: date, end: date) -> 
     u = df.attrs.get("users") if hasattr(df, "attrs") else None
     if provider == "grandstream" and u:
         return _grandstream(u, a, start, end)
-    if provider in ("bicom", "vela", "marksmann"):
+    if provider == "marksmann":
+        return _marksmann(df, a, start, end)
+    if provider in ("bicom", "vela"):
         return _basic(a)
     return _empty("none", "This phone system's export records calls per line, not per person, so a user "
                           "assessment isn't possible from it.")
@@ -216,6 +218,158 @@ def _grandstream(u: dict, a: Analysis, start: date, end: date) -> UserReport:
     obs = {e: _user_observations(r, t, team, groups, hourly.get(e), group_table) for e, r in t.iterrows()}
     team_obs = _team_observations(t, team, groups, a)
     return UserReport(True, "full", t, hourly, obs, team_obs, team, groups, group_table=group_table)
+
+
+def _branch(line_name: str) -> str:
+    return str(line_name).split(" \u00b7 ")[0].strip() or "Other line"
+
+
+def _marksmann(df: pd.DataFrame, a: Analysis, start: date, end: date) -> UserReport:
+    """Marks & Mann: the export names who answered each call (and on which branch line), who dialled out, and
+    colleague-to-colleague calls - so we get branches, working pattern and internal calls, but not every
+    handset that rang (no pick-up rate / ring time)."""
+    s = a.settings
+    ans = a.inbound[a.inbound["outcome"].isin(["Answered", "Answered via overflow"]) & (a.inbound["answered_by"] != "")]
+    ans = ans.assign(branch=ans["line_name"].map(_branch))
+    outb = a.outbound
+    team_t = a.team
+    names = sorted(set(ans["answered_by"]) | set(outb["agent"]))
+    if not names:
+        return _empty("mm", "No named activity found in this period.")
+
+    internal = pd.DataFrame(df.attrs.get("mm_internal") or [],
+                            columns=["ts", "from", "to", "secs", "ok", "transfer", "parent"])
+    internal["transfer"] = internal["transfer"].fillna(False).astype(bool)
+    if len(internal):
+        internal["ts"] = pd.to_datetime(internal["ts"])
+        internal = _window(internal, "ts", start, end)
+
+    t = pd.DataFrame(index=pd.Index(names, name="ext"))
+    t["name"] = names
+    g = ans.groupby("answered_by").agg(answered=("call_id", "count"), in_talk_s=("talk_s", "sum"))
+    t = t.join(g)
+    t["outbound"] = team_t["outbound"].reindex(names) if len(team_t) else 0
+    t["connected"] = team_t["connected"].reindex(names) if len(team_t) else 0
+    t["out_talk_s"] = team_t["talk_s"].reindex(names) if len(team_t) else 0
+    t["returned"] = team_t["missed_calls_returned"].reindex(names) if len(team_t) else 0
+    t["numbers"] = outb.groupby("agent")["dialled"].nunique().reindex(names)
+    t["internal_made"] = internal.groupby("from").size().reindex(names) if len(internal) else 0
+    t["internal_received"] = (internal[internal["ok"]].groupby("to").size().reindex(names)
+                              if len(internal) else 0)
+    tr = internal[internal["transfer"]] if len(internal) else internal
+    t["transfers_out"] = tr.groupby("from").size().reindex(names) if len(tr) else 0
+    t["transfers_in"] = tr[tr["ok"]].groupby("to").size().reindex(names) if len(tr) else 0
+    for c in ("answered", "in_talk_s", "outbound", "connected", "out_talk_s", "returned", "numbers",
+              "internal_made", "internal_received", "transfers_out", "transfers_in"):
+        t[c] = pd.to_numeric(t[c], errors="coerce").fillna(0).astype(int)
+    t["internal_made"] = t["internal_made"] - t["transfers_out"]  # plain colleague calls, transfers counted apart
+    for c in ("rang", "lost", "declined"):
+        t[c] = 0
+    t["pickup_pct"] = np.nan
+    t["avg_ring_s"] = np.nan
+    total_answered = int(t["answered"].sum())
+    t["share_pct"] = [_pct(r.answered, total_answered) for r in t.itertuples()]
+    t["connect_pct"] = [_pct(r.connected, r.outbound) for r in t.itertuples()]
+    t["avg_in_talk_s"] = [r.in_talk_s / r.answered if r.answered else np.nan for r in t.itertuples()]
+    t["avg_out_talk_s"] = [r.out_talk_s / r.connected if r.connected else np.nan for r in t.itertuples()]
+    t["talk_s"] = t["in_talk_s"] + t["out_talk_s"]
+    t["handled"] = t["answered"] + t["outbound"]
+
+    # which branch lines each person answers (the Marks & Mann equivalent of ring groups)
+    by_b = ans.groupby(["answered_by", "branch"]).size()
+    groups: dict = {}
+    t["groups"] = ""
+    t["main_branch_pct"] = np.nan
+    for n in names:
+        if n in by_b.index.get_level_values(0):
+            bb = by_b.loc[n].sort_values(ascending=False)
+            keep = bb[(bb >= 5) | (bb >= 0.15 * bb.sum())]
+            t.loc[n, "groups"] = ", ".join(keep.index)
+            t.loc[n, "main_branch_pct"] = _pct(bb.iloc[0], bb.sum())
+            for b in keep.index:
+                groups.setdefault(b, []).append(n)
+
+    # working pattern + hourly profile
+    hourly, first_l, last_l, days_l, ooh_l = {}, [], [], [], []
+    for n in names:
+        ts = pd.concat([ans.loc[ans["answered_by"] == n, "ts"], outb.loc[outb["agent"] == n, "ts"]])
+        hi = ans.loc[ans["answered_by"] == n, "ts"].dt.hour.value_counts()
+        ho = outb.loc[outb["agent"] == n, "ts"].dt.hour.value_counts()
+        hourly[n] = pd.DataFrame({"inbound": hi.reindex(range(24), fill_value=0),
+                                  "outbound": ho.reindex(range(24), fill_value=0)})
+        if len(ts):
+            daily = ts.to_frame("ts").assign(d=ts.dt.date).groupby("d")["ts"].agg(["min", "max"])
+            first_l.append(float(np.median([x.hour * 60 + x.minute for x in daily["min"]])))
+            last_l.append(float(np.median([x.hour * 60 + x.minute for x in daily["max"]])))
+            days_l.append(len(daily))
+            ooh_l.append(int((~in_hours(ts, s)).sum()))
+        else:
+            first_l.append(np.nan); last_l.append(np.nan); days_l.append(0); ooh_l.append(0)  # noqa: E702
+    t["first_active"], t["last_active"], t["active_days"], t["out_of_hours"] = first_l, last_l, days_l, ooh_l
+    t["per_day"] = [r.handled / r.active_days if r.active_days else 0 for r in t.itertuples()]
+    t = t[(t["handled"] + t["internal_made"]) > 0].sort_values("handled", ascending=False)
+
+    # branch performance table (calls, answered, missed, who carries the load)
+    inb = a.inbound[~a.inbound["outcome"].isin(["Short abandon", "Failed"])]
+    inb = inb.assign(branch=inb["line_name"].map(_branch))
+    gt = []
+    for b, gg in inb.groupby("branch"):
+        ok = gg["outcome"].isin(["Answered", "Answered via overflow"])
+        who = gg[ok & (gg["answered_by"] != "")]["answered_by"].value_counts()
+        gt.append({"group": b, "members": int((who >= 1).sum()), "calls": len(gg), "answered": int(ok.sum()),
+                   "lost": int((~ok).sum()), "answer_pct": _pct(ok.sum(), len(gg)),
+                   "answering_people": int((who >= 1).sum()), "top": who.index[0] if len(who) else "-",
+                   "top_pct": _pct(who.iloc[0], who.sum()) if len(who) else np.nan,
+                   "voicemail": int((gg["outcome"] == "Voicemail").sum()), "avg_pickup": np.nan})
+    group_table = pd.DataFrame(gt)
+    if len(group_table):
+        group_table = group_table[group_table["calls"] >= 3]
+
+    team = {
+        "people": int((t["handled"] > 0).sum()), "answered": total_answered, "outbound": int(t["outbound"].sum()),
+        "connected": int(t["connected"].sum()), "avg_ring_s": np.nan,
+        "avg_in_talk_s": float(t["in_talk_s"].sum() / total_answered) if total_answered else np.nan,
+        "avg_out_talk_s": float(t["out_talk_s"].sum() / max(1, t["connected"].sum())),
+        "connect_pct": _pct(t["connected"].sum(), t["outbound"].sum()), "returned": int(t["returned"].sum()),
+        "internal": int(len(internal) - len(tr)), "transfers": int(len(tr)), "talk_s": int(t["talk_s"].sum()),
+        "top": t.sort_values("answered", ascending=False).iloc[0]["name"] if total_answered else "-",
+    }
+    obs = {}
+    for e, r in t.iterrows():
+        o = _user_observations(r, t, team, {}, hourly.get(e), None)
+        if r["groups"] and r["answered"] >= 10:
+            bs = r["groups"].split(", ")
+            o.insert(1, (f"Answers calls for {bs[0]}" + (f" ({r['main_branch_pct']:.0f}% of their calls)"
+                                                         if len(bs) > 1 else " only"))
+                     + (f", also covering {', '.join(bs[1:])}." if len(bs) > 1 else "."))
+        if r["internal_made"] >= 15:
+            o.append(f"Made {int(r['internal_made'])} internal calls to colleagues.")
+        tr_lines = []
+        if r["transfers_in"] >= 3:
+            tr_lines.append(f"Took {int(r['transfers_in'])} customer calls transferred from colleagues.")
+        if r["transfers_out"] >= 3 and not (r["answered"] and r["transfers_out"] / r["answered"] >= 0.1):
+            to_ = tr[tr["from"] == e]["to"].value_counts() if len(tr) else pd.Series(dtype=int)
+            tr_lines.append(f"Transferred {int(r['transfers_out'])} customer calls on to colleagues"
+                            + (f", mostly to {to_.index[0]} ({int(to_.iloc[0])})." if len(to_) else "."))
+        o[2:2] = tr_lines  # hand-overs are more useful than the routine lines further down
+        obs[e] = o[:7]
+    team_obs = _team_observations(t, team, {}, a)
+    for row in group_table.sort_values("calls", ascending=False).itertuples() if len(group_table) else []:
+        if row.answered >= 20 and row.top_pct >= 35 and row.answering_people > 1:
+            team_obs.append(f"{row.group}: {row.top} answers {row.top_pct:.0f}% of the branch's calls - "
+                            f"make sure someone covers when they're out.")
+        if row.answer_pct < a.settings.answer_target_pct and row.calls >= 20:
+            team_obs.append(f"{row.group} answered {row.answer_pct:.0f}% of its calls ({row.lost} missed, "
+                            f"{row.voicemail} to voicemail).")
+    if team["internal"]:
+        team_obs.append(f"{team['internal']:,} internal calls between colleagues in the period.")
+    if len(tr):
+        pairs = tr.groupby(["from", "to"]).size().sort_values(ascending=False)
+        (f_, t2), n_ = pairs.index[0], int(pairs.iloc[0])
+        team_obs.append(f"Most common hand-over: {f_} → {t2} ({n_} call{'s' if n_ != 1 else ''}).")
+    note = ("The phone system's export shows who answered each call, on which branch line, who dialled out and "
+            "internal calls - but not every handset that rang, so pick-up rate and time to answer aren't available.")
+    return UserReport(True, "mm", t, hourly, obs, team_obs, team, groups, note, group_table=group_table)
 
 
 def _basic(a: Analysis) -> UserReport:
@@ -400,7 +554,7 @@ def _team_observations(t: pd.DataFrame, team: dict, groups: dict, a: Analysis) -
         o.append(f"{team['returned']} missed calls were returned by named team members; "
                  f"{a.kpis['unreturned_callers']} callers still have not been spoken to.")
     if team.get("transfers"):
-        o.append(f"{team['transfers']} calls were transferred between colleagues.")
+        o.append(f"{team['transfers']} call{' was' if team['transfers'] == 1 else 's were'} transferred between colleagues.")
     return o
 
 
@@ -428,7 +582,18 @@ def user_table_view(rep: UserReport) -> pd.DataFrame:
         "Typical hours": [f"{_clock(r.first_active)}-{_clock(r.last_active)}" if r.first_active == r.first_active
                           else "-" for r in t.itertuples()],
     })
-    if rep.level == "basic":
+    if rep.level == "mm":
+        v = v.rename(columns={"Ring group(s)": "Branches answered", "Internal calls": "Internal calls made",
+                              "Transfers": "Transferred out"})
+        has_tr = bool(rep.team.get("transfers"))
+        if has_tr:
+            v.insert(v.columns.get_loc("Transferred out") + 1, "Transferred in", t["transfers_in"].values)
+        v.insert(v.columns.get_loc("Talk time"), "Numbers dialled", t["numbers"].values)
+        v = v.drop(columns=["Ext", "Rang them", "Pick-up %", "Lost while ringing", "Avg time to answer"]
+                   + ([] if has_tr else ["Transferred out"]))
+        v.insert(v.columns.get_loc("Share of team %") + 1, "Avg inbound call", t["avg_in_talk_s"].map(fmt_dur).values)
+        v["Out of hours"] = t["out_of_hours"].values
+    elif rep.level == "basic":
         v = v.drop(columns=["Ext", "Ring group(s)", "Rang them", "Pick-up %", "Lost while ringing", "Internal calls",
                             "Transfers", "Typical hours"])
         if t["avg_ring_s"].isna().all():
