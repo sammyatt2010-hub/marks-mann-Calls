@@ -278,18 +278,52 @@ def to_text(v) -> str:
 # Recording file names, e.g. 2026-10-31_15_44_10__447891917079_441449867590.mp3
 # --------------------------------------------------------------------------- #
 FNAME_RE = re.compile(r"(\d{4}-\d{2}-\d{2})_(\d{2})_(\d{2})_(\d{2})__\+?(\d+)_\+?(\d+)")
+DATE_YMD = re.compile(r"(20\d{2})[-_. ]?(0[1-9]|1[0-2])[-_. ]?(0[1-9]|[12]\d|3[01])")
+DATE_DMY = re.compile(r"(0[1-9]|[12]\d|3[01])[-_. ](0[1-9]|1[0-2])[-_. ](20\d{2})")
+TIME_RE = re.compile(r"([01]\d|2[0-3])[-_:.hH ]?([0-5]\d)[-_:.mM ]?([0-5]\d)?")
+PHONE_RE = re.compile(r"\+?\d{10,13}")
 
 
 def parse_recording_name(name: str) -> dict | None:
-    m = FNAME_RE.search(os.path.basename(name))
-    if not m:
+    """Read what we can from a recording's file name: the exact phone-system pattern
+    (2026-10-31_15_44_10__447891917079_441449867590.mp3) first, then any date, time and phone numbers in it.
+    Returns {"ts", "date", "numbers", "from", "to", "exact"} or None if nothing useful was found."""
+    base = os.path.splitext(os.path.basename(name))[0]
+    m = FNAME_RE.search(base)
+    if m:
+        d, hh, mm, ss, a, b = m.groups()
+        try:
+            ts = datetime.strptime(f"{d} {hh}:{mm}:{ss}", "%Y-%m-%d %H:%M:%S")
+            return {"ts": ts, "date": ts.date(), "numbers": [a, b], "from": a, "to": b, "exact": True}
+        except ValueError:
+            pass
+    rest, day, ts = base, None, None
+    dm = DATE_YMD.search(rest)
+    if dm:
+        y, mo, d = dm.groups()
+    else:
+        dm = DATE_DMY.search(rest)
+        if dm:
+            d, mo, y = dm.groups()
+    if dm:
+        try:
+            day = datetime(int(y), int(mo), int(d)).date()
+        except ValueError:
+            day = None
+        after = rest[dm.end():]
+        tm = TIME_RE.match(after.lstrip("_-T. "))
+        if day and tm:
+            hh, mi, ss = tm.groups()
+            ts = datetime(day.year, day.month, day.day, int(hh), int(mi), int(ss or 0))
+            cut = len(after) - len(after.lstrip("_-T. ")) + tm.end()
+            rest = rest[:dm.start()] + " " + after[cut:]
+        else:
+            rest = rest[:dm.start()] + " " + after
+    numbers = PHONE_RE.findall(rest)
+    if not (day or numbers):
         return None
-    d, hh, mm, ss, a, b = m.groups()
-    try:
-        ts = datetime.strptime(f"{d} {hh}:{mm}:{ss}", "%Y-%m-%d %H:%M:%S")
-    except ValueError:
-        return None
-    return {"ts": ts, "from": a, "to": b}
+    return {"ts": ts, "date": day, "numbers": numbers, "from": numbers[0] if numbers else "",
+            "to": numbers[1] if len(numbers) > 1 else "", "exact": False}
 
 
 # --------------------------------------------------------------------------- #
@@ -316,7 +350,10 @@ def _retryable(err) -> bool:
 def get_client(api_key: str):
     from google import genai
     from google.genai import types as gtypes
-    return genai.Client(api_key=api_key, http_options=gtypes.HttpOptions(timeout=REQUEST_TIMEOUT_MS))
+    # api_version pinned: structured JSON replies (response_schema) only work on v1beta, and newer
+    # google-genai releases can default to v1 - which fails with "JSON mode is not enabled for api version v1".
+    return genai.Client(api_key=api_key,
+                        http_options=gtypes.HttpOptions(api_version="v1beta", timeout=REQUEST_TIMEOUT_MS))
 
 
 def assess(client, audio_bytes: bytes, suffix: str, context: dict, log=lambda m: None) -> dict:
